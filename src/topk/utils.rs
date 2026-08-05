@@ -5,6 +5,10 @@ use heavykeeper::CuckooTopK;
 use std::sync::atomic::Ordering;
 type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
 
+/// Cell storage widths for the TopK sketch: u32 fingerprint and counter
+/// halve per-cell memory versus the u64 default.
+type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
+
 /// KeySpace Notification Events
 pub const RESERVE_EVENT: &str = "topk.reserve";
 pub const ADD_EVENT: &str = "topk.add";
