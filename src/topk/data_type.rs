@@ -7,6 +7,10 @@ type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::{logging, raw};
 
+/// Cell storage widths for the TopK sketch: u32 fingerprint and counter
+/// halve per-cell memory versus the u64 default.
+type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
+
 /// Used for decoding and encoding `TopKObject`. Currently used in AOF Rewrite.
 /// Bump this when the serialized object layout changes.
 pub const TOPK_OBJECT_VERSION: u8 = 1;
