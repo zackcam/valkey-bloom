@@ -845,6 +845,7 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
     /// version: u8
     /// hasher_probe: u64  (SERIALIZE_HASHER_PROBE hashed with the sketch's hasher)
     /// width, depth, decay(bits), top_items, max_kicks: u64 each
+    /// linear: u8  (1 = linear-scan lookup, 0 = hash table)
     /// lobbies:  width        x (fingerprint: F, count: C)
     /// heavy:    width*depth  x (fingerprint: F, count: C)
     /// pq_len: u64
