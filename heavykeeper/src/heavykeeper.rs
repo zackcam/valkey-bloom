@@ -1,7 +1,7 @@
 use crate::hash_composition::HashComposer;
 use crate::priority_queue::TopKQueue;
 use crate::serialization::*;
-use ahash::RandomState;
+use crate::sip::SipState;
 use fastrand::Rng;
 use std::borrow::Borrow;
 use std::clone::Clone;
@@ -84,7 +84,7 @@ pub struct TopK<T: Ord + Clone + Hash> {
     decay_thresholds: Vec<u64>,
     buckets: Vec<Vec<Bucket>>,
     priority_queue: TopKQueue<T>,
-    hasher: RandomState,
+    hasher: SipState,
     random: Rng,
 }
 
@@ -94,7 +94,7 @@ pub struct Builder<T> {
     depth: Option<usize>,
     decay: Option<f64>,
     seed: Option<u64>,
-    hasher: Option<RandomState>,
+    hasher: Option<SipState>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -122,7 +122,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
 
     // New constructor that takes a seed
     pub fn with_seed(k: usize, width: usize, depth: usize, decay: f64, seed: u64) -> Self {
-        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
+        let hasher = SipState::with_seed(seed);
         Self::with_components(
             k,
             width,
@@ -138,7 +138,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         width: usize,
         depth: usize,
         decay: f64,
-        hasher: RandomState,
+        hasher: SipState,
     ) -> Self {
         Self::with_components(
             k,
@@ -155,7 +155,7 @@ impl<T: Ord + Clone + Hash> TopK<T> {
         width: usize,
         depth: usize,
         decay: f64,
-        hasher: RandomState,
+        hasher: SipState,
         rng: Rng,
     ) -> Self {
         // Pre-allocate with capacity to avoid resizing
@@ -544,7 +544,7 @@ impl TopK<Vec<u8>> {
     /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, TopKDeserializeError> {
         let mut reader = ByteReader::new(bytes);
-        let probe = RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
+        let probe = SipState::with_seed(seed).hash_one(SERIALIZE_HASHER_PROBE);
         reader.read_header(VARIANT, probe)?;
 
         let (width, depth, decay, top_items) = reader.read_params()?;
@@ -681,7 +681,7 @@ impl<T: Ord + Clone + Hash> Builder<T> {
         self
     }
 
-    pub fn hasher(mut self, hasher: RandomState) -> Self {
+    pub fn hasher(mut self, hasher: SipState) -> Self {
         self.hasher = Some(hasher);
         self
     }
@@ -702,9 +702,9 @@ impl<T: Ord + Clone + Hash> Builder<T> {
 
         let hasher = self.hasher.unwrap_or_else(|| {
             if let Some(seed) = self.seed {
-                RandomState::with_seeds(seed, seed, seed, seed)
+                SipState::with_seed(seed)
             } else {
-                RandomState::new()
+                SipState::random()
             }
         });
 

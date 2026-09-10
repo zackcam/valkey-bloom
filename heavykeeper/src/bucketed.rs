@@ -6,7 +6,7 @@ use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use ahash::RandomState;
+use crate::sip::SipState;
 use fastrand::Rng;
 use thiserror::Error;
 
@@ -100,7 +100,7 @@ pub struct BucketedTopK<T: Ord + Clone + Hash> {
     cells: Box<[Cell]>,
     decay_thresholds: Box<[u64]>,
     priority_queue: TopKQueue<T>,
-    hasher: RandomState,
+    hasher: SipState,
     rng: Rng,
     min_pq_count: u64,
     top_items: usize,
@@ -112,7 +112,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
     }
 
     pub fn with_seed(k: usize, width: usize, depth: usize, decay: f64, seed: u64) -> Self {
-        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
+        let hasher = SipState::with_seed(seed);
         Self::with_hasher(k, width, depth, decay, hasher)
     }
 
@@ -122,7 +122,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         width: usize,
         depth: usize,
         decay: f64,
-        hasher: RandomState,
+        hasher: SipState,
     ) -> Self {
         Self::with_components(
             k,
@@ -143,7 +143,7 @@ impl<T: Ord + Clone + Hash> BucketedTopK<T> {
         width: usize,
         depth: usize,
         decay: f64,
-        hasher: RandomState,
+        hasher: SipState,
         rng: Rng,
     ) -> Self {
         let priority_queue = TopKQueue::with_capacity_and_hasher(k, hasher.clone());
@@ -548,7 +548,7 @@ impl BucketedTopK<Vec<u8>> {
     /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, BucketedDeserializeError> {
         let mut reader = ByteReader::new(bytes);
-        let probe = RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
+        let probe = SipState::with_seed(seed).hash_one(SERIALIZE_HASHER_PROBE);
         reader.read_header(VARIANT, probe)?;
 
         let (width, depth, decay, top_items) = reader.read_params()?;
@@ -601,7 +601,7 @@ impl BucketedTopK<Vec<u8>> {
 
 #[cfg(test)]
 impl<T: Ord + Clone + Hash> BucketedTopK<T> {
-    pub(crate) fn hasher(&self) -> &RandomState {
+    pub(crate) fn hasher(&self) -> &SipState {
         &self.hasher
     }
 
@@ -616,7 +616,7 @@ pub struct BucketedBuilder<T> {
     depth: Option<usize>,
     decay: Option<f64>,
     seed: Option<u64>,
-    hasher: Option<RandomState>,
+    hasher: Option<SipState>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -658,7 +658,7 @@ impl<T: Ord + Clone + Hash> BucketedBuilder<T> {
         self.seed = Some(s);
         self
     }
-    pub fn hasher(mut self, h: RandomState) -> Self {
+    pub fn hasher(mut self, h: SipState) -> Self {
         self.hasher = Some(h);
         self
     }
@@ -693,9 +693,9 @@ impl<T: Ord + Clone + Hash> BucketedBuilder<T> {
         }
         let hasher = self.hasher.unwrap_or_else(|| {
             if let Some(s) = self.seed {
-                RandomState::with_seeds(s, s, s, s)
+                SipState::with_seed(s)
             } else {
-                RandomState::new()
+                SipState::random()
             }
         });
         let rng = Rng::with_seed(self.seed.unwrap_or(0));

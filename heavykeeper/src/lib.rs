@@ -23,5 +23,8 @@ pub use traits::{Counter, Fingerprint};
 mod hash_composition;
 mod priority_queue;
 
+mod sip;
+pub use sip::SipState;
+
 mod serialization;
 pub use serialization::DeserializeError;
