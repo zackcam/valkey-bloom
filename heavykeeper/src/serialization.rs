@@ -20,11 +20,19 @@ pub enum DeserializeError {
     #[error("Payload is a different sketch variant: got tag {actual} (expected {expected})")]
     WrongVariant { expected: u8, actual: u8 },
 
-    #[error("Hasher mismatch: the supplied hasher produces probe {actual} but the payload holds {expected} (wrong seed, a different hasher, or a different ahash version/architecture)")]
+    #[error("Hasher mismatch: seed produces probe {actual} but payload holds {expected} (payload was written with a different seed or hasher)")]
     HasherMismatch { expected: u64, actual: u64 },
 
     #[error("Unsupported serialization version {version} (this build expects {expected})")]
     UnsupportedVersion { version: u8, expected: u8 },
+
+    #[error("Cell width mismatch: payload holds {actual_fp}-byte fingerprints and {actual_count}-byte counters, but this build expects {expected_fp}/{expected_count}")]
+    CellWidthMismatch {
+        expected_fp: u8,
+        actual_fp: u8,
+        expected_count: u8,
+        actual_count: u8,
+    },
 
     #[error("Invalid {field} value: {detail}")]
     InvalidField { field: &'static str, detail: String },
@@ -42,21 +50,19 @@ pub enum DeserializeError {
 
 /// Magic tag at the start of every serialized sketch (`b"HVYK"`).
 pub(crate) const MAGIC: [u8; 4] = *b"HVYK";
-/// On-disk format version.
-///
-/// Bump whenever the byte layout changes, OR when the interpretation of any
-/// field changes even though no bytes move — including the RNG algorithm
-/// behind `rng_state` (see `fastrand_stream_is_pinned`) and the hash family
-/// behind the fingerprints and `hasher_probe`. A payload's `rng_state` cannot
-/// be translated across RNG algorithms; a future loader migrating an old
-/// version should reuse the stored bytes as a fresh seed (replication pairs
-/// must full-resync across such an upgrade).
+/// On-disk format version. Bump whenever the byte layout changes.
+/// Version 1 (initial release format): cuckoo payloads carry explicit cell
+/// widths (fingerprint and counter byte sizes) so a stream written by one
+/// width instantiation fails loudly instead of misparsing when read by
+/// another, and all hashing is seeded SipHash-1-3 ([`crate::SipState`]) so
+/// payloads are portable across architectures and crate versions.
 pub(crate) const VERSION: u8 = 1;
 /// Probe hashed at serialize time to detect a wrong seed on load.
 ///
-/// `ahash` output is not stable across CPU architectures or `ahash` versions,
-/// so a payload only loads on the same architecture and `ahash` version that
-/// wrote it; otherwise the probe mismatches and load fails with `HasherMismatch`.
+/// SipHash-1-3 is a frozen specification, so the probe (and all sketch
+/// placement hashing) is identical on every architecture, endianness, and
+/// crate version. A probe mismatch therefore means exactly one thing: the
+/// seed passed to `from_bytes` is not the seed the payload was written with.
 pub(crate) const SERIALIZE_HASHER_PROBE: &[u8] = b"heavykeeper-serialize-hasher-probe";
 /// Bytes per serialized cell: `(fingerprint: u64, count: u64)`.
 pub(crate) const CELL_SIZE: usize = 16;
@@ -221,14 +227,14 @@ impl<'a> ByteReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahash::RandomState;
+    use crate::sip::SipState;
 
     const SEED: u64 = 42;
     const VARIANT: u8 = 0;
 
     /// Probe for `seed`, matching what `from_bytes` computes.
     fn probe_for(seed: u64) -> u64 {
-        RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE)
+        SipState::with_seed(seed).hash_one(SERIALIZE_HASHER_PROBE)
     }
 
     /// Build a valid header (magic, variant, version, probe) for `SEED`.
@@ -237,7 +243,9 @@ mod tests {
         out.extend_from_slice(&MAGIC);
         out.push(variant);
         out.push(VERSION);
-        out.extend_from_slice(&probe_for(SEED).to_le_bytes());
+        let probe =
+            SipState::with_seed(SEED).hash_one(SERIALIZE_HASHER_PROBE);
+        out.extend_from_slice(&probe.to_le_bytes());
         out
     }
 
@@ -377,9 +385,9 @@ mod tests {
     ///
     /// The round-trip tests can't catch a format change that alters write and
     /// read symmetrically; this hardcodes the bytes so any layout drift fails
-    /// loudly. The `hasher_probe` field (bytes 6..14) is checked against a
-    /// live hash rather than a constant because ahash output is
-    /// architecture-dependent; everything else is fixed.
+    /// loudly. The `hasher_probe` field (bytes 6..14) is computed with the same
+    /// seeded SipHash-1-3 the sketch uses, so it is deterministic across
+    /// architectures; everything else is fixed.
     ///
     /// If this fails: the on-disk format changed. Bump [`VERSION`] and update
     /// the layout docs on every variant's `to_bytes` — do not just update the
@@ -420,6 +428,9 @@ mod tests {
         expected.extend_from_slice(&0x3FECCCCCCCCCCCCDu64.to_le_bytes()); // decay = 0.9f64 bits
         expected.extend_from_slice(&3u64.to_le_bytes()); // top_items
         expected.extend_from_slice(&8u64.to_le_bytes()); // max_kicks (default)
+        expected.push(1); // linear-scan lookup (default)
+        expected.push(8); // fingerprint width (bytes) = u64
+        expected.push(8); // counter width (bytes) = u64
         expected.extend_from_slice(&[0u8; 2 * 16]); // 2 empty lobby cells
         expected.extend_from_slice(&[0u8; 2 * 16]); // 2x1 empty heavy cells
         expected.extend_from_slice(&0u64.to_le_bytes()); // pq_len

@@ -11,7 +11,7 @@ use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use ahash::RandomState;
+use crate::sip::SipState;
 use fastrand::Rng;
 use thiserror::Error;
 
@@ -164,7 +164,7 @@ pub struct CuckooTopK<T: Ord + Clone + Hash, F: Fingerprint = u64, C: Counter = 
     lobbies: Box<[CuckooCell<F, C>]>,
     heavy: Box<[CuckooCell<F, C>]>,
     priority_queue: TopKQueue<T>,
-    hasher: RandomState,
+    hasher: SipState,
     rng: Rng,
     min_pq_count: u64,
     top_items: usize,
@@ -199,7 +199,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         seed: u64,
         linear: bool,
     ) -> Self {
-        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
+        let hasher = SipState::with_seed(seed);
         Self::with_components(
             k,
             width,
@@ -221,7 +221,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         width: usize,
         depth: usize,
         decay: f64,
-        hasher: RandomState,
+        hasher: SipState,
     ) -> Self {
         Self::with_components(
             k,
@@ -246,7 +246,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         width: usize,
         depth: usize,
         decay: f64,
-        hasher: RandomState,
+        hasher: SipState,
         rng: Rng,
         max_kicks: usize,
         linear: bool,
@@ -451,6 +451,21 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         self.lobbies.len() * std::mem::size_of::<CuckooCell<F, C>>()
             + self.heavy.len() * std::mem::size_of::<CuckooCell<F, C>>()
             + self.priority_queue.mem_bytes(item_heap)
+    }
+
+    /// Structural bytes a sketch with these params allocates up front,
+    /// derived from the real cell and queue-slot layouts so it can never
+    /// drift from what [`Self::mem_bytes`] later reports. Includes a
+    /// worst-case share for the optional lookup table; excludes tracked
+    /// items' own heap bytes (runtime data). Saturates instead of
+    /// overflowing so oversized params compare as huge rather than wrapping
+    /// small.
+    pub fn estimated_mem_bytes(top_items: u64, width: u64, depth: u64) -> u64 {
+        let cell = std::mem::size_of::<CuckooCell<F, C>>() as u64;
+        let cells = width.saturating_mul(depth.saturating_add(1)); // heavy rows + lobby row
+        cells
+            .saturating_mul(cell)
+            .saturating_add(top_items.saturating_mul(TopKQueue::<T>::entry_mem_bytes() as u64))
     }
 
     /// Merge `other` into `self`. Both sketches must share width, depth,
@@ -792,18 +807,22 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         increment: u64,
     ) -> Option<u64> {
         let mut remaining = increment;
+        // The threshold depends only on the cell count, which changes only on a
+        // successful decay. Hoist the powf out of the per-unit loop so a large
+        // increment does not pay one powf per unit.
+        let mut current_count = self.lobbies[bucket].count.as_u64();
+        let mut threshold = self.decay_threshold(current_count);
         while remaining > 0 {
-            let current_count = self.lobbies[bucket].count.as_u64();
-            let threshold = self.decay_threshold(current_count);
             if self.rng.u64(..) < threshold {
+                current_count = current_count.saturating_sub(1);
                 let lobby = &mut self.lobbies[bucket];
-                let new_count = lobby.count.as_u64().saturating_sub(1);
-                lobby.count = C::from_u64(new_count);
+                lobby.count = C::from_u64(current_count);
                 if lobby.count == C::ZERO {
                     lobby.fingerprint = fingerprint;
                     lobby.count = C::from_u64(remaining);
                     return Some(remaining);
                 }
+                threshold = self.decay_threshold(current_count);
             }
             remaining -= 1;
         }
@@ -846,6 +865,8 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
     /// hasher_probe: u64  (SERIALIZE_HASHER_PROBE hashed with the sketch's hasher)
     /// width, depth, decay(bits), top_items, max_kicks: u64 each
     /// linear: u8  (1 = linear-scan lookup, 0 = hash table)
+    /// fp_width: u8  (bytes per cell fingerprint, size_of::<F>())
+    /// count_width: u8  (bytes per cell counter, size_of::<C>())
     /// lobbies:  width        x (fingerprint: F, count: C)
     /// heavy:    width*depth  x (fingerprint: F, count: C)
     /// pq_len: u64
@@ -853,8 +874,9 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
     /// rng_state: 8 bytes  (fastrand seed)
     /// ```
     ///
-    /// Cells are written at the storage widths of `F` and `C`, so a stream
-    /// written by one width instantiation cannot be read back by another.
+    /// Cells are written at the storage widths of `F` and `C`. The widths are
+    /// recorded in the stream so a mismatched instantiation fails on load with
+    /// `CellWidthMismatch` instead of misparsing the cells.
     ///
     /// The seed is not stored; the hasher is rebuilt from the seed passed to
     /// [`from_bytes`](CuckooTopK::from_bytes). A `hasher_probe` guards against a
@@ -864,9 +886,9 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
         let cs = cuckoo_cell_size::<F, C>();
         let cell_count = self.lobbies.len() + self.heavy.len();
         let pq_len = self.priority_queue.len();
-        // Capacity hint: header (magic + variant + version + probe + 5 u64s) + cells + pq_len u64 + pq estimate + rng.
+        // Capacity hint: header (magic + variant + version + probe + 5 u64s + linear + widths) + cells + pq_len u64 + pq estimate + rng.
         let mut out = Vec::with_capacity(
-            MAGIC.len() + 2 + 8 * 7 + cell_count * cs + pq_len * 24 + RNG_STATE_SIZE,
+            MAGIC.len() + 5 + 8 * 7 + cell_count * cs + pq_len * 24 + RNG_STATE_SIZE,
         );
 
         out.extend_from_slice(&MAGIC);
@@ -880,6 +902,9 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
         out.extend_from_slice(&(self.max_kicks as u64).to_le_bytes());
         // Lookup strategy: 1 = linear scan, 0 = hash table.
         out.push(self.linear() as u8);
+        // Cell storage widths, so a mismatched instantiation fails loudly on load.
+        out.push(F::SIZE as u8);
+        out.push(C::SIZE as u8);
 
         for cell in self.lobbies.iter().chain(self.heavy.iter()) {
             cell.fingerprint.to_le_bytes_into(&mut out);
@@ -901,7 +926,7 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
     /// `seed` must match the sketch's original seed; the hasher rebuilt from it.
     pub fn from_bytes(bytes: &[u8], seed: u64) -> Result<Self, CuckooDeserializeError> {
         let mut reader = ByteReader::new(bytes);
-        let probe = RandomState::with_seeds(seed, seed, seed, seed).hash_one(SERIALIZE_HASHER_PROBE);
+        let probe = SipState::with_seed(seed).hash_one(SERIALIZE_HASHER_PROBE);
         reader.read_header(VARIANT, probe)?;
 
         let (width, depth, decay, top_items) = reader.read_params()?;
@@ -914,6 +939,18 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
         }
         // Lookup strategy: 1 = linear scan, 0 = hash table.
         let linear = reader.take_u8("linear")? != 0;
+        // Cell storage widths must match this build's instantiation; the cells
+        // that follow are raw width-sized pairs with no other framing.
+        let fp_width = reader.take_u8("fingerprint width")?;
+        let count_width = reader.take_u8("counter width")?;
+        if fp_width as usize != F::SIZE || count_width as usize != C::SIZE {
+            return Err(CuckooDeserializeError::CellWidthMismatch {
+                expected_fp: F::SIZE as u8,
+                actual_fp: fp_width,
+                expected_count: C::SIZE as u8,
+                actual_count: count_width,
+            });
+        }
 
         let expected_heavy =
             width
@@ -960,7 +997,7 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
         // is sized by the unbounded `top_items` header, so a tampered stream
         // could force a huge reserve. Fine for restoring our own dumps (RDB); if
         // ever fed untrusted bytes, bound `top_items` first.
-        let hasher = RandomState::with_seeds(seed, seed, seed, seed);
+        let hasher = SipState::with_seed(seed);
         let mut sketch = Self::with_components(
             top_items,
             width,
@@ -996,7 +1033,7 @@ pub struct CuckooBuilder<T, F: Fingerprint = u64, C: Counter = u64> {
     depth: Option<usize>,
     decay: Option<f64>,
     seed: Option<u64>,
-    hasher: Option<RandomState>,
+    hasher: Option<SipState>,
     max_kicks: Option<usize>,
     linear: Option<bool>,
     _phantom: std::marker::PhantomData<(T, F, C)>,
@@ -1042,7 +1079,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooBuilder<T, F, C> {
         self.seed = Some(s);
         self
     }
-    pub fn hasher(mut self, h: RandomState) -> Self {
+    pub fn hasher(mut self, h: SipState) -> Self {
         self.hasher = Some(h);
         self
     }
@@ -1087,9 +1124,9 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooBuilder<T, F, C> {
         }
         let hasher = self.hasher.unwrap_or_else(|| {
             if let Some(s) = self.seed {
-                RandomState::with_seeds(s, s, s, s)
+                SipState::with_seed(s)
             } else {
-                RandomState::new()
+                SipState::random()
             }
         });
         let rng = Rng::with_seed(self.seed.unwrap_or(0));
@@ -1757,6 +1794,40 @@ mod tests {
         assert!(matches!(err, CuckooDeserializeError::WrongVariant { .. }));
     }
 
+    // The up-front estimate must upper-bound what the sketch structurally
+    // allocates, or the module's size limit could be bypassed at RESERVE time.
+    #[test]
+    fn test_estimated_mem_bytes_upper_bounds_structural_usage() {
+        let mut sketch = CuckooTopK::<Vec<u8>, u32, u32>::with_seed(10, 64, 4, 0.9, 42);
+        for i in 0..50u32 {
+            sketch.add(&format!("k{i}").into_bytes(), (i as u64) + 1);
+        }
+        let estimate = CuckooTopK::<Vec<u8>, u32, u32>::estimated_mem_bytes(10, 64, 4);
+        // Structural bytes only (`|_| 0` excludes tracked items' own heap bytes).
+        assert!(estimate >= sketch.mem_bytes(|_| 0) as u64);
+    }
+
+    // Regression: a payload written by one cell-width instantiation must fail
+    // loudly when read by another, not misparse the cells.
+    #[test]
+    fn test_deserialize_rejects_cell_width_mismatch() {
+        let mut narrow = CuckooTopK::<Vec<u8>, u32, u32>::with_seed(10, 64, 4, 0.9, 42);
+        narrow.add(&b"item".to_vec(), 5);
+        let bytes = narrow.to_bytes();
+        let Err(err) = CuckooTopK::<Vec<u8>>::from_bytes(&bytes, 42) else {
+            panic!("mismatched cell widths must fail");
+        };
+        assert!(matches!(
+            err,
+            CuckooDeserializeError::CellWidthMismatch {
+                expected_fp: 8,
+                actual_fp: 4,
+                expected_count: 8,
+                actual_count: 4,
+            }
+        ));
+    }
+
     #[test]
     fn test_deserialize_rejects_zero_max_kicks() {
         let mut bytes = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42).to_bytes();
@@ -1808,8 +1879,8 @@ mod tests {
     fn test_serialize_appends_rng_state() {
         let empty = CuckooTopK::<Vec<u8>>::with_seed(10, 64, 4, 0.9, 42);
         let bytes = empty.to_bytes();
-        // Header (magic + variant + version + probe + 5 u64s + linear byte) + lobbies + heavy + pq_len + rng state.
-        let header = MAGIC.len() + 2 + 8 * 6 + 1;
+        // Header (magic + variant + version + probe + 5 u64s + linear byte + 2 width bytes) + lobbies + heavy + pq_len + rng state.
+        let header = MAGIC.len() + 2 + 8 * 6 + 1 + 2;
         let cells = (64 + 64 * 4) * cuckoo_cell_size::<u64, u64>();
         let pq_len = 8;
         assert_eq!(bytes.len(), header + cells + pq_len + RNG_STATE_SIZE);

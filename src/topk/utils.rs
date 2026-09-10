@@ -3,7 +3,6 @@ use crate::metrics;
 use crate::topk::data_type::TOPK_OBJECT_VERSION;
 use heavykeeper::CuckooTopK;
 use std::sync::atomic::Ordering;
-type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
 
 /// Cell storage widths for the TopK sketch: u32 fingerprint and counter
 /// halve per-cell memory versus the u64 default.
@@ -135,15 +134,16 @@ impl TopKObject {
         std::mem::size_of::<TopKObject>() + self.sketch.mem_bytes(|item| item.capacity())
     }
 
-    /// Bytes the sketch allocates up front.
+    /// Bytes the sketch allocates up front. Delegates to the sketch's own
+    /// layout-derived estimate so the numbers can never drift from the real
+    /// `Sketch` instantiation (cell width, queue slot size).
     pub fn estimated_size(k: u32, width: u32, depth: u32) -> u64 {
-        let (k, width, depth) = (k as u64, width as u64, depth as u64);
-        // CuckooCell<u32,u32> = 8 bytes per cell (fingerprint + counter).
-        let heavy = width.saturating_mul(depth).saturating_mul(8);
         (std::mem::size_of::<TopKObject>() as u64) // wrapper struct
-            .saturating_add(width.saturating_mul(8)) // lobby cells
-            .saturating_add(heavy) // heavy cells
-            .saturating_add(k.saturating_mul(128)) // priority queue: ~128 bytes per k entry
+            .saturating_add(Sketch::estimated_mem_bytes(
+                k as u64,
+                width as u64,
+                depth as u64,
+            ))
     }
 
     /// Whether these params fit within the configured topk-memory-usage-limit.

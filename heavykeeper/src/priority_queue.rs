@@ -1,4 +1,4 @@
-use ahash::RandomState;
+use crate::sip::SipState;
 use hashbrown::HashTable;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -36,13 +36,16 @@ pub(crate) struct TopKQueue<T> {
     table: HashTable<u32>, // hash -> slot index into `item_store` (unused when `linear`)
     linear: bool,
     capacity: usize,
+    /// Monotonic insertion counter used to break count ties (older wins). On
+    /// wrap at `u32::MAX` the live slots are renumbered in relative order via
+    /// [`Self::next_sequence`], so tie ordering never degrades.
     sequence: u32,
-    hasher: RandomState,
+    hasher: SipState,
 }
 
 impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     /// Build a queue using the hash-table lookup strategy.
-    pub(crate) fn with_capacity_and_hasher(capacity: usize, hasher: RandomState) -> Self {
+    pub(crate) fn with_capacity_and_hasher(capacity: usize, hasher: SipState) -> Self {
         Self::with_capacity_hasher_linear(capacity, hasher, false)
     }
 
@@ -50,7 +53,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     /// and leaves the hash table unallocated; otherwise the hash table is used.
     pub(crate) fn with_capacity_hasher_linear(
         capacity: usize,
-        hasher: RandomState,
+        hasher: SipState,
         linear: bool,
     ) -> Self {
         Self {
@@ -71,7 +74,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
     #[allow(dead_code)]
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self::with_capacity_hasher_linear(capacity, RandomState::new(), true)
+        Self::with_capacity_hasher_linear(capacity, SipState::random(), true)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -81,6 +84,19 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     /// Whether this queue uses the linear-scan lookup strategy.
     pub(crate) fn linear(&self) -> bool {
         self.linear
+    }
+
+    /// Worst-case structural bytes to budget per tracked entry, for sizing a
+    /// queue from `capacity` before it exists: the slot and heap-index cell
+    /// (exact, from the real types) plus the optional hash table's share
+    /// (upper bound: hashbrown documents a 7/8 max load factor and
+    /// power-of-two bucket counts at 5 bytes per bucket -- one `u32` index
+    /// plus one control byte -- so at most `2 * 8/7 * 5 < 12` bytes per
+    /// entry). Excludes the item's own heap bytes, which depend on runtime
+    /// data. Actual usage is reported exactly by [`Self::mem_bytes`].
+    pub(crate) const fn entry_mem_bytes() -> usize {
+        const TABLE_SHARE_UPPER: usize = 12;
+        std::mem::size_of::<Slot<T>>() + std::mem::size_of::<u32>() + TABLE_SHARE_UPPER
     }
 
     /// Returns the heap memory (in bytes) used by this queue's containers.
@@ -96,30 +112,9 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         use std::mem::size_of;
         let store_bytes = self.item_store.capacity() * size_of::<Slot<T>>();
         let heap_bytes = self.heap.capacity() * size_of::<u32>();
-        // hashbrown internals: `buckets` is the next power of two >= ceil(capacity*8/7).
-        let buckets = {
-            let cap = self.table.capacity();
-            if cap == 0 {
-                0
-            } else {
-                ((cap * 8 + 6) / 7).next_power_of_two()
-            }
-        };
-        #[cfg(all(
-            target_feature = "sse2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        ))]
-        const GROUP_WIDTH: usize = 16;
-        #[cfg(not(all(
-            target_feature = "sse2",
-            any(target_arch = "x86", target_arch = "x86_64")
-        )))]
-        const GROUP_WIDTH: usize = 8;
-        let table_bytes = if buckets == 0 {
-            0
-        } else {
-            buckets * (size_of::<u32>() + 1) + GROUP_WIDTH
-        };
+        // hashbrown reports its own allocation, so the estimate cannot drift
+        // from the crate's internal layout across upgrades.
+        let table_bytes = self.table.allocation_size();
         let item_bytes: usize = self.item_store.iter().map(|s| item_heap(&s.item)).sum();
         store_bytes + heap_bytes + table_bytes + item_bytes
     }
@@ -164,8 +159,11 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     {
         if let Some(slot_idx) = self.find_slot(item) {
             let slot = &mut self.item_store[slot_idx];
-            debug_assert!(count >= slot.count, "update_if_present must not decrease");
-            if count == slot.count {
+            // The count-min-sketch estimate can fall below the value already
+            // tracked (a later add where every row decayed yields a smaller
+            // max_count). The PQ keeps the high-water estimate, so a
+            // non-increasing update is a no-op, not an error.
+            if count <= slot.count {
                 return true;
             }
             slot.count = count;
@@ -189,6 +187,25 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
     pub(crate) fn is_full(&self) -> bool {
         self.item_store.len() >= self.capacity
+    }
+
+    /// Return the next tie-break sequence value. When the counter would wrap,
+    /// renumber the live slots to 1..=len preserving their relative order, so
+    /// count-tie ordering stays correct instead of silently degrading. The
+    /// renumber is O(k log k) once per 2^32 assignments, amortized nothing.
+    fn next_sequence(&mut self) -> u32 {
+        if self.sequence == u32::MAX {
+            let mut order: Vec<u32> = (0..self.item_store.len() as u32).collect();
+            order.sort_unstable_by_key(|&idx| self.item_store[idx as usize].sequence);
+            for (new_seq, &idx) in order.iter().enumerate() {
+                self.item_store[idx as usize].sequence = new_seq as u32 + 1;
+            }
+            // Slot count is bounded by capacity (well below u32::MAX), so the
+            // counter has full headroom again.
+            self.sequence = self.item_store.len() as u32;
+        }
+        self.sequence += 1;
+        self.sequence
     }
 
     /// Insert or update `item` to `count`.
@@ -233,12 +250,12 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
             let slot_idx = self.item_store.len() as u32;
             let heap_pos = slot_idx;
-            self.sequence = self.sequence.wrapping_add(1);
+            let sequence = self.next_sequence();
 
             self.item_store.push(Slot {
                 item,
                 count,
-                sequence: self.sequence,
+                sequence,
                 heap_pos,
             });
             self.heap.push(slot_idx);
@@ -259,19 +276,27 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
             if count > min_count {
                 if !self.linear {
                     let old_hash = self.hasher.hash_one(&self.item_store[min_slot_idx].item);
-                    if let Ok(entry) = self
+                    match self
                         .table
                         .find_entry(old_hash, |&idx| idx == min_slot_idx as u32)
                     {
-                        entry.remove();
+                        Ok(entry) => {
+                            entry.remove();
+                        }
+                        // A miss means the table and item_store have desynced;
+                        // surface it in debug builds instead of leaving a stale
+                        // entry pointing at the reused slot.
+                        Err(_) => debug_assert!(
+                            false,
+                            "evicted min slot {min_slot_idx} missing from lookup table"
+                        ),
                     }
                 }
 
                 let old_item =
                     std::mem::replace(&mut self.item_store[min_slot_idx].item, item);
                 self.item_store[min_slot_idx].count = count;
-                self.sequence = self.sequence.wrapping_add(1);
-                self.item_store[min_slot_idx].sequence = self.sequence;
+                self.item_store[min_slot_idx].sequence = self.next_sequence();
 
                 if !self.linear {
                     self.table.insert_unique(hash, min_slot_idx as u32, |&idx| {
@@ -430,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_update_existing() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
         queue.upsert("a", 1);
         queue.upsert("b", 2);
         queue.upsert("a", 3); // Update a's count
@@ -441,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_heap_cleanup() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
 
         // Insert initial items
         queue.upsert("a", 1);
@@ -464,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_insertion_order() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(3, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(3, SipState::random());
 
         // Insert items with same count in specific order
         queue.upsert("a", 1);
@@ -477,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_heap_consistency() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
 
         // Fill queue
         queue.upsert("a", 1);
@@ -497,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_capacity_overflow() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
 
         // Insert more items than capacity
         queue.upsert("a", 1);
@@ -513,8 +538,45 @@ mod tests {
     }
 
     #[test]
+    fn test_upsert_returns_evicted_item() {
+        // Both lookup strategies must report the displaced item and keep
+        // lookups consistent afterwards.
+        for linear in [true, false] {
+            let mut queue =
+                TopKQueue::with_capacity_hasher_linear(2, SipState::random(), linear);
+            assert_eq!(queue.upsert("a", 1), None);
+            assert_eq!(queue.upsert("b", 2), None);
+            // Full queue, does not beat the min: rejected, nothing evicted.
+            assert_eq!(queue.upsert("c", 1), None);
+            // Full queue, beats the min: "a" is displaced and returned.
+            assert_eq!(queue.upsert("c", 3), Some("a"));
+            assert!(!queue.contains(&"a"), "linear={linear}");
+            assert_eq!(queue.get(&"c"), Some(3), "linear={linear}");
+            assert_eq!(queue.get(&"b"), Some(2), "linear={linear}");
+        }
+    }
+
+    // Regression: when the sequence counter wraps, live slots are renumbered
+    // so count-tie ordering is preserved instead of the new item sorting first.
+    #[test]
+    fn test_sequence_wrap_preserves_tie_order() {
+        let mut queue = TopKQueue::with_capacity_and_hasher(3, SipState::random());
+        queue.upsert("first", 5);
+        queue.upsert("second", 5);
+        // Force the next assignment to hit the wrap point.
+        queue.sequence = u32::MAX;
+        queue.upsert("third", 5);
+
+        // Insertion order among equal counts must survive the wrap.
+        let items: Vec<_> = queue.iter().collect();
+        assert_eq!(items, vec![(&"first", 5), (&"second", 5), (&"third", 5)]);
+        // The counter was renumbered down to the live-slot range.
+        assert_eq!(queue.sequence, 3);
+    }
+
+    #[test]
     fn test_repeated_updates() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
 
         // Insert and update same item repeatedly
         for i in 1..100 {
@@ -531,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_heap_property() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(10, RandomState::new());
+        let mut queue = TopKQueue::with_capacity_and_hasher(10, SipState::random());
 
         // Insert in reverse order to test heap maintenance
         for i in (0..=10).rev() {

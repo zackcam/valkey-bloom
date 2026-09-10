@@ -3,7 +3,6 @@ use crate::wrapper::topk_callback;
 use crate::MODULE_NAME;
 use heavykeeper::CuckooTopK;
 use valkey_module::digest::Digest;
-type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::{logging, raw};
 
