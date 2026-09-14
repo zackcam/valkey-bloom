@@ -1,4 +1,5 @@
 use crate::sip::SipState;
+use crate::traits::Counter;
 use hashbrown::HashTable;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -15,9 +16,9 @@ fn realloc_vec<E, R: Reallocator>(vec: &mut Vec<E>, reallocator: &mut R) {
 }
 
 #[derive(Clone)]
-struct Slot<T> {
+struct Slot<T, C> {
     item: T,
-    count: u64,
+    count: C,
     sequence: u64,
     heap_pos: u32,
 }
@@ -26,9 +27,14 @@ struct Slot<T> {
 ///
 /// Items live in `item_store`; a `hashbrown` hash table maps each item to its
 /// slot index for O(1) lookup on every add.
+///
+/// `C` is the stored counter width. The public API speaks `u64`; values are
+/// saturated into `C` on the way in. A sketch whose cells are `u32` never
+/// produces a count above `u32::MAX`, so storing `u64` here would waste four
+/// bytes per slot.
 #[derive(Clone)]
-pub(crate) struct TopKQueue<T> {
-    item_store: Vec<Slot<T>>,
+pub(crate) struct TopKQueue<T, C: Counter = u64> {
+    item_store: Vec<Slot<T, C>>,
     heap: Vec<u32>,        // slot indices, min-heap ordered by count
     table: HashTable<u32>, // hash -> slot index into `item_store`
     capacity: usize,
@@ -37,7 +43,7 @@ pub(crate) struct TopKQueue<T> {
     hasher: SipState,
 }
 
-impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
+impl<T: Ord + Clone + Hash + PartialEq, C: Counter> TopKQueue<T, C> {
     pub(crate) fn with_capacity_and_hasher(capacity: usize, hasher: SipState) -> Self {
         Self {
             item_store: Vec::with_capacity(capacity),
@@ -69,7 +75,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         F: Fn(&T) -> usize,
     {
         use std::mem::size_of;
-        let store_bytes = self.item_store.capacity() * size_of::<Slot<T>>();
+        let store_bytes = self.item_store.capacity() * size_of::<Slot<T, C>>();
         let heap_bytes = self.heap.capacity() * size_of::<u32>();
         // hashbrown reports its own allocation, so the estimate cannot drift
         // from the crate's internal layout across upgrades.
@@ -93,9 +99,10 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
     pub(crate) fn get<Q>(&self, item: &Q) -> Option<u64>
     where
         T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
-        self.find_slot(item).map(|idx| self.item_store[idx].count)
+        self.find_slot(item)
+            .map(|idx| self.item_store[idx].count.as_u64())
     }
 
     pub(crate) fn contains<Q>(&self, item: &Q) -> bool
@@ -116,6 +123,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         T: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let count = C::from_u64(count);
         if let Some(slot_idx) = self.find_slot(item) {
             let slot = &mut self.item_store[slot_idx];
             // The count-min-sketch estimate can fall below the value already
@@ -140,7 +148,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         if self.item_store.is_empty() {
             0
         } else {
-            self.item_store[self.heap[0] as usize].count
+            self.item_store[self.heap[0] as usize].count.as_u64()
         }
     }
 
@@ -150,9 +158,12 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
 
     /// Insert or update `item` to `count`.
     ///
+    /// `count` is saturated into the stored width `C`.
+    ///
     /// Returns `Some(evicted)` when a previously tracked item is displaced
     /// by this call, otherwise `None`.
     pub(crate) fn upsert(&mut self, item: T, count: u64) -> Option<T> {
+        let count = C::from_u64(count);
         let hash = self.hasher.hash_one(&item);
         // Fast path: update existing item
         if let Some(slot_idx) = self.find_slot_with_hash(&item, hash) {
@@ -245,7 +256,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         let mut items: Vec<_> = self
             .item_store
             .iter()
-            .map(|s| (&s.item, s.count, s.sequence))
+            .map(|s| (&s.item, s.count.as_u64(), s.sequence))
             .collect();
 
         // Sort by count descending, then by sequence ascending.
@@ -266,7 +277,7 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
         let mut items: Vec<_> = self
             .item_store
             .iter()
-            .map(|s| (&s.item, s.count, s.sequence))
+            .map(|s| (&s.item, s.count.as_u64(), s.sequence))
             .collect();
         items.sort_unstable_by_key(|(_, _, seq)| *seq);
         items.into_iter().map(|(k, count, _)| (k, count))
@@ -361,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_basic_insertion() {
-        let mut queue = TopKQueue::with_capacity(2);
+        let mut queue = TopKQueue::<_, u64>::with_capacity(2);
         queue.upsert("a", 1);
         queue.upsert("b", 2);
 
@@ -371,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_update_existing() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(2, SipState::random());
         queue.upsert("a", 1);
         queue.upsert("b", 2);
         queue.upsert("a", 3); // Update a's count
@@ -382,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_heap_cleanup() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(2, SipState::random());
 
         // Insert initial items
         queue.upsert("a", 1);
@@ -405,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_insertion_order() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(3, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(3, SipState::random());
 
         // Insert items with same count in specific order
         queue.upsert("a", 1);
@@ -418,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_heap_consistency() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(2, SipState::random());
 
         // Fill queue
         queue.upsert("a", 1);
@@ -438,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_capacity_overflow() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(2, SipState::random());
 
         // Insert more items than capacity
         queue.upsert("a", 1);
@@ -456,7 +467,7 @@ mod tests {
     #[test]
     fn test_upsert_returns_evicted_item() {
         // The displaced item is reported and lookups stay consistent afterwards.
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(2, SipState::random());
         assert_eq!(queue.upsert("a", 1), None);
         assert_eq!(queue.upsert("b", 2), None);
         // Full queue, does not beat the min: rejected, nothing evicted.
@@ -468,9 +479,35 @@ mod tests {
         assert_eq!(queue.get(&"b"), Some(2));
     }
 
+    // A `u32` counter width saturates on the way in and keeps ordering
+    // consistent with the saturated value; the slot is 32 bytes for a
+    // `Box<[u8]>` key (16-byte fat pointer + u32 count + u64 sequence +
+    // u32 heap_pos).
+    #[test]
+    fn test_u32_counter_saturates_and_slot_layout() {
+        let mut queue: TopKQueue<Box<[u8]>, u32> =
+            TopKQueue::with_capacity_and_hasher(2, SipState::with_seed(1));
+        queue.upsert(Box::from(&b"a"[..]), 10);
+        queue.upsert(Box::from(&b"b"[..]), u64::MAX);
+        assert_eq!(queue.get(&b"b"[..]), Some(u32::MAX as u64));
+        // Raising past the cap is a no-op, and a same-as-cap update is too.
+        assert!(queue.update_if_present(&b"b"[..], u64::MAX - 1));
+        assert_eq!(queue.get(&b"b"[..]), Some(u32::MAX as u64));
+        assert_eq!(queue.min_count(), 10);
+        // A count that saturates to the current min does not displace it.
+        assert_eq!(queue.upsert(Box::from(&b"c"[..]), 10), None);
+        assert_eq!(
+            queue.upsert(Box::from(&b"c"[..]), 11),
+            Some(Box::from(&b"a"[..]))
+        );
+
+        assert_eq!(std::mem::size_of::<Slot<Box<[u8]>, u32>>(), 32);
+        assert_eq!(std::mem::size_of::<Slot<Vec<u8>, u64>>(), 48);
+    }
+
     #[test]
     fn test_repeated_updates() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(2, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(2, SipState::random());
 
         // Insert and update same item repeatedly
         for i in 1..100 {
@@ -487,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_heap_property() {
-        let mut queue = TopKQueue::with_capacity_and_hasher(10, SipState::random());
+        let mut queue = TopKQueue::<_, u64>::with_capacity_and_hasher(10, SipState::random());
 
         // Insert in reverse order to test heap maintenance
         for i in (0..=10).rev() {
@@ -496,7 +533,7 @@ mod tests {
 
         // Verify heap property: parent should be <= children for min-heap
         for i in 1..queue.heap.len() {
-            let parent_idx = TopKQueue::<String>::parent(i);
+            let parent_idx = TopKQueue::<String, u64>::parent(i);
             if parent_idx > 0 {
                 // Skip root's parent
                 let parent_count = queue.item_store[queue.heap[parent_idx] as usize].count;
@@ -531,7 +568,7 @@ mod tests {
     fn test_table_footprint_is_fixed_under_churn() {
         for k in [10usize, 100, 1000] {
             let mut queue: TopKQueue<Vec<u8>> =
-                TopKQueue::with_capacity_and_hasher(k, SipState::with_seed(7));
+                TopKQueue::<_, u64>::with_capacity_and_hasher(k, SipState::with_seed(7));
             for i in 0..k {
                 queue.upsert(format!("seed-{i}").into_bytes(), 1_000);
             }

@@ -18,7 +18,10 @@ pub use cuckoo::{
 };
 
 pub mod traits;
-pub use traits::{Counter, Fingerprint};
+pub use traits::{Counter, Fingerprint, FromBorrowed};
+
+mod small_key;
+pub use small_key::SmallKey;
 
 mod hash_composition;
 mod priority_queue;

@@ -1,6 +1,37 @@
-//! Generic storage-width traits for fingerprint and counter cells.
+//! Generic storage-width traits for fingerprint and counter cells, plus the
+//! key-construction trait used to store a borrowed lookup key.
 
 use std::fmt::Debug;
+
+/// Build an owned key `Self` from a borrowed `Q`. Sketches take lookups as
+/// `&Q` and only materialize an owned `T` when an item enters the priority
+/// queue. Unlike `ToOwned`, the stored type chooses how it is built, which
+/// is what lets `CuckooTopK<SmallKey>` accept `&[u8]`.
+pub trait FromBorrowed<Q: ?Sized> {
+    fn from_borrowed(borrowed: &Q) -> Self;
+}
+
+/// Any `Clone` type can be built from a borrow of itself.
+impl<Q: Clone> FromBorrowed<Q> for Q {
+    #[inline]
+    fn from_borrowed(borrowed: &Q) -> Self {
+        borrowed.clone()
+    }
+}
+
+impl FromBorrowed<[u8]> for Vec<u8> {
+    #[inline]
+    fn from_borrowed(borrowed: &[u8]) -> Self {
+        borrowed.to_vec()
+    }
+}
+
+impl FromBorrowed<str> for String {
+    #[inline]
+    fn from_borrowed(borrowed: &str) -> Self {
+        borrowed.to_owned()
+    }
+}
 
 /// A fingerprint stored in each cell. Truncates a full `u64` hash into the
 /// chosen storage width.

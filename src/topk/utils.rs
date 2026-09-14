@@ -1,12 +1,14 @@
 use crate::configs;
 use crate::metrics;
 use crate::topk::data_type::TOPK_OBJECT_VERSION;
-use heavykeeper::CuckooTopK;
+use heavykeeper::{CuckooTopK, SmallKey};
 use std::sync::atomic::Ordering;
 
 /// Cell storage widths for the TopK sketch: u32 fingerprint and counter
-/// halve per-cell memory versus the u64 default.
-type Sketch = CuckooTopK<Vec<u8>, u32, u32>;
+/// halve per-cell memory versus the u64 default. Keys are `SmallKey`: 16
+/// bytes in the slot, items up to 15 bytes stored inline with no heap
+/// allocation, longer items spilled to the heap.
+type Sketch = CuckooTopK<SmallKey, u32, u32>;
 
 /// KeySpace Notification Events
 pub const RESERVE_EVENT: &str = "topk.reserve";
@@ -113,10 +115,11 @@ impl TopKObject {
     }
 
     /// Estimated heap size of this object: wrapper struct + sketch internals
-    /// (cell arrays, priority queue) + per-item buffer capacity.
+    /// (cell arrays, priority queue) + the heap bytes of spilled items
+    /// (inline items cost nothing beyond their slot).
     /// The remaining undercount is allocator overhead and HashMap metadata.
     pub fn memory_usage(&self) -> usize {
-        std::mem::size_of::<TopKObject>() + self.sketch.mem_bytes(|item| item.capacity())
+        std::mem::size_of::<TopKObject>() + self.sketch.mem_bytes(|item| item.heap_bytes())
     }
 
     /// Bytes the sketch allocates up front. Delegates to the sketch's own
@@ -292,14 +295,21 @@ impl TopKObject {
         self.num_items = new_num_items;
         metrics::TOPK_TOTAL_ITEMS_ADDED_ACROSS_OBJECTS.fetch_add(delta, Ordering::Relaxed);
         let (evicted, inserted) = self.sketch.add_with_evicted(item, increment);
-        let added = if inserted { item.len() } else { 0 };
-        let removed = evicted.as_ref().map_or(0, Vec::len);
+        // Only spilled keys own heap bytes; inline keys live in the slot,
+        // which is already counted in the queue's structural bytes.
+        let added = if inserted {
+            SmallKey::heap_bytes_for_len(item.len())
+        } else {
+            0
+        };
+        let removed = evicted.as_ref().map_or(0, |e| e.heap_bytes());
         if added >= removed {
             metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.fetch_add(added - removed, Ordering::Relaxed);
         } else {
             metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.fetch_sub(removed - added, Ordering::Relaxed);
         }
-        evicted
+        // A spilled key hands over its allocation; an inline key copies.
+        evicted.map(SmallKey::into_vec)
     }
 
     /// Return the estimated count for `item`, or 0 if it has no residual
@@ -313,12 +323,13 @@ impl TopKObject {
         self.sketch.contains_top_k(item)
     }
 
-    /// Return the Top-K items
+    /// Return the Top-K items. `into_vec` hands over a spilled key's
+    /// allocation and copies an inline key's 15 bytes or fewer.
     pub fn list(&self) -> Vec<(Vec<u8>, u64)> {
         self.sketch
             .list()
             .into_iter()
-            .map(|node| (node.item, node.count))
+            .map(|node| (node.item.into_vec(), node.count))
             .collect()
     }
 }
@@ -618,6 +629,38 @@ mod tests {
         assert_eq!(
             TopKObject::decode_object(&blob, false).err(),
             Some(DECODE_TOPK_OBJECT_FAILED)
+        );
+    }
+
+    #[test]
+    fn test_memory_usage_charges_only_spilled_items() {
+        // Inline items (<= 15 bytes) live in the slot and add nothing;
+        // spilled items add exactly their length. The per-add gauge delta
+        // must agree with the full recount so Drop stays balanced.
+        let mut topk = TopKObject::new_reserved(4, 64, 4, DEFAULT_DECAY, 42);
+        let empty = topk.memory_usage();
+        let gauge_before = metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.load(Ordering::Relaxed);
+
+        topk.add(b"255.255.255.255", 10); // 15 bytes: inline
+        topk.add(b"id:42", 9); // inline
+        assert_eq!(topk.memory_usage(), empty);
+
+        let long = b"a spilled key longer than fifteen bytes";
+        topk.add(long, 8);
+        assert_eq!(topk.memory_usage(), empty + long.len());
+
+        let gauge_after = metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.load(Ordering::Relaxed);
+        assert_eq!(gauge_after - gauge_before, long.len());
+
+        // Evicting the spilled key (the min, count 8) gives its bytes back;
+        // the inline replacement costs nothing.
+        topk.add(b"hot", 100);
+        let evicted = topk.add(b"hotter", 200).expect("displaces the min");
+        assert_eq!(evicted, long);
+        assert_eq!(topk.memory_usage(), empty);
+        assert_eq!(
+            metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.load(Ordering::Relaxed),
+            gauge_before
         );
     }
 

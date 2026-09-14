@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::priority_queue::TopKQueue;
 use crate::serialization::*;
-use crate::traits::{Counter, Fingerprint};
+use crate::traits::{Counter, Fingerprint, FromBorrowed};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -163,7 +163,7 @@ pub struct CuckooTopK<T: Ord + Clone + Hash, F: Fingerprint = u64, C: Counter = 
     decay: f64,
     lobbies: Box<[CuckooCell<F, C>]>,
     heavy: Box<[CuckooCell<F, C>]>,
-    priority_queue: TopKQueue<T>,
+    priority_queue: TopKQueue<T, C>,
     hasher: SipState,
     rng: Rng,
     min_pq_count: u64,
@@ -201,13 +201,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     /// compatibility is probe-checked against the partner's hasher; see
     /// [`CuckooTopK::merge`]. Parameters are not validated; use
     /// [`CuckooTopK::builder`] for a fallible, validated construction path.
-    pub fn with_hasher(
-        k: usize,
-        width: usize,
-        depth: usize,
-        decay: f64,
-        hasher: SipState,
-    ) -> Self {
+    pub fn with_hasher(k: usize, width: usize, depth: usize, decay: f64, hasher: SipState) -> Self {
         Self::with_components(
             k,
             width,
@@ -262,8 +256,8 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     /// [`list`]: CuckooTopK::list
     pub fn add<Q>(&mut self, item: &Q, increment: u64)
     where
-        T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        T: Borrow<Q> + FromBorrowed<Q>,
+        Q: Hash + Eq + ?Sized,
     {
         let _ = self.add_with_evicted(item, increment);
     }
@@ -277,8 +271,8 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     /// [`add`]: CuckooTopK::add
     pub fn add_with_evicted<Q>(&mut self, item: &Q, increment: u64) -> (Option<T>, bool)
     where
-        T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        T: Borrow<Q> + FromBorrowed<Q>,
+        Q: Hash + Eq + ?Sized,
     {
         if increment == 0 {
             return (None, false);
@@ -313,7 +307,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     pub fn count<Q>(&self, item: &Q) -> u64
     where
         T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         if let Some(c) = self.priority_queue.get(item) {
             return c;
@@ -329,7 +323,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     pub fn bucket_count<Q>(&self, item: &Q) -> u64
     where
         T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         let fp = F::from_hash(self.hasher.hash_one(item));
         let (primary, alternate) = self.bucket_pair(fp.as_u64());
@@ -351,7 +345,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     pub fn contains<Q>(&self, item: &Q) -> bool
     where
         T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         self.count(item) > 0
     }
@@ -361,7 +355,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     pub fn query<Q>(&self, item: &Q) -> bool
     where
         T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         self.contains(item)
     }
@@ -658,8 +652,9 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
 
     #[inline]
     fn find_heavy_in_bucket(&self, fingerprint: F, bucket: usize) -> Option<usize> {
-        self.heavy_range(bucket)
-            .find(|&idx| self.heavy[idx].count > C::ZERO && self.heavy[idx].fingerprint == fingerprint)
+        self.heavy_range(bucket).find(|&idx| {
+            self.heavy[idx].count > C::ZERO && self.heavy[idx].fingerprint == fingerprint
+        })
     }
 
     #[inline]
@@ -810,8 +805,8 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
 
     fn update_priority_queue<Q>(&mut self, item: &Q, count: u64) -> (Option<T>, bool)
     where
-        T: Borrow<Q>,
-        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+        T: Borrow<Q> + FromBorrowed<Q>,
+        Q: Hash + Eq + ?Sized,
     {
         if self.priority_queue.update_if_present(item, count) {
             self.min_pq_count = self.priority_queue.min_count();
@@ -823,14 +818,19 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         }
 
         let had_room = !self.priority_queue.is_full();
-        let evicted = self.priority_queue.upsert(item.to_owned(), count);
+        let evicted = self.priority_queue.upsert(T::from_borrowed(item), count);
         self.min_pq_count = self.priority_queue.min_count();
         let inserted = evicted.is_some() || had_room;
         (evicted, inserted)
     }
 }
 
-impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
+/// Byte-stream serialization for any key type that exposes its bytes. The
+/// wire layout does not depend on the key type.
+impl<T, F: Fingerprint, C: Counter> CuckooTopK<T, F, C>
+where
+    T: Ord + Clone + Hash + AsRef<[u8]> + FromBorrowed<[u8]>,
+{
     /// Serialize the sketch to a byte stream. Layout (little-endian):
     ///
     /// ```text
@@ -885,8 +885,9 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
 
         out.extend_from_slice(&(pq_len as u64).to_le_bytes());
         for (item, count) in self.priority_queue.iter_by_sequence() {
-            out.extend_from_slice(&(item.len() as u64).to_le_bytes());
-            out.extend_from_slice(item);
+            let bytes = item.as_ref();
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(bytes);
             out.extend_from_slice(&count.to_le_bytes());
         }
         out.extend_from_slice(&self.rng.get_seed().to_le_bytes());
@@ -941,12 +942,13 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
                     detail: format!("size overflows usize (width={width})"),
                 })?;
         let lobbies = parse_cuckoo_cells::<F, C>(reader.take(lobby_bytes, "lobbies")?);
-        let heavy_bytes = expected_heavy.checked_mul(cs).ok_or_else(|| {
-            CuckooDeserializeError::InvalidField {
-                field: "heavy",
-                detail: format!("size overflows usize (width*depth={expected_heavy})"),
-            }
-        })?;
+        let heavy_bytes =
+            expected_heavy
+                .checked_mul(cs)
+                .ok_or_else(|| CuckooDeserializeError::InvalidField {
+                    field: "heavy",
+                    detail: format!("size overflows usize (width*depth={expected_heavy})"),
+                })?;
         let heavy = parse_cuckoo_cells::<F, C>(reader.take(heavy_bytes, "heavy")?);
 
         // Priority queue: a length prefix, then variable-length entries.
@@ -982,7 +984,7 @@ impl<F: Fingerprint, C: Counter> CuckooTopK<Vec<u8>, F, C> {
 
         for _ in 0..pq_len {
             let key_len = reader.take_usize("priority_queue key length")?;
-            let item = reader.take(key_len, "priority_queue key")?.to_vec();
+            let item = T::from_borrowed(reader.take(key_len, "priority_queue key")?);
             let count = reader.take_u64("priority_queue count")?;
             sketch.priority_queue.upsert(item, count);
         }
