@@ -219,11 +219,26 @@ impl<T: Ord + Clone + Hash + PartialEq> TopKQueue<T> {
                 self.table.insert_unique(hash, min_slot_idx as u32, |&idx| {
                     self.hasher.hash_one(&self.item_store[idx as usize].item)
                 });
+                self.compact_table_if_grown();
                 self.sift_down(0);
                 return Some(old_item);
             }
         }
         None
+    }
+
+    /// Rebuild the lookup table at its construction size if evict/insert
+    /// churn made it grow. hashbrown leaves tombstones on `remove`, and once
+    /// they exhaust the growth budget it doubles the allocation instead of
+    /// rehashing in place, even though live entries never exceed `capacity`.
+    /// Rebuilding clears the tombstones and keeps the table's footprint fixed,
+    /// which the memory gauge and the up-front size estimate rely on.
+    fn compact_table_if_grown(&mut self) {
+        let store = &self.item_store;
+        let hasher = &self.hasher;
+        self.table.shrink_to(self.capacity, |&idx| {
+            hasher.hash_one(&store[idx as usize].item)
+        });
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&T, u64)> {
@@ -506,6 +521,38 @@ mod tests {
                 items[i].1,
                 items[i + 1].1
             );
+        }
+    }
+
+    // Evict/insert churn at a constant live count must not grow the lookup
+    // table: hashbrown leaves tombstones on remove and would otherwise double
+    // the allocation once they exhaust the growth budget.
+    #[test]
+    fn test_table_footprint_is_fixed_under_churn() {
+        for k in [10usize, 100, 1000] {
+            let mut queue: TopKQueue<Vec<u8>> =
+                TopKQueue::with_capacity_and_hasher(k, SipState::with_seed(7));
+            for i in 0..k {
+                queue.upsert(format!("seed-{i}").into_bytes(), 1_000);
+            }
+            let table_bytes = queue.table.allocation_size();
+            // `|_| 0` excludes item heap bytes, so only the structure is measured.
+            let structural_bytes = queue.mem_bytes(|_| 0);
+
+            // Every insert beats the current min, so each one evicts exactly one.
+            for r in 0..5000u64 {
+                assert!(queue
+                    .upsert(format!("hot-{r}").into_bytes(), 2_000 + r)
+                    .is_some());
+            }
+            assert_eq!(
+                queue.table.allocation_size(),
+                table_bytes,
+                "k={k}: table grew under churn"
+            );
+            // Lookups still work after the rebuilds.
+            assert!(queue.contains(b"hot-4999".as_slice()));
+            assert!(!queue.contains(b"seed-0".as_slice()));
         }
     }
 }
