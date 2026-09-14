@@ -43,17 +43,13 @@ pub const EXCEEDS_MAX_TOPK_SIZE: &str = "ERR operation exceeds topk object memor
 pub const DECODE_TOPK_OBJECT_FAILED: &str = "ERR topk object decoding failed";
 pub const DECODE_UNSUPPORTED_VERSION: &str = "ERR topk object decoding failed. Unsupported version";
 
-/// TopKObject wraps the underlying CuckooTopK sketch together with the
-/// parameters used to construct it.
-///  (k, width, depth, decay, seed)
+/// TopKObject wraps the underlying CuckooTopK sketch together with the seed
+/// it was built from and the running item count. k, width, depth and decay
+/// are read from the sketch rather than duplicated here.
 pub struct TopKObject {
-    k: u32,
-    width: u32,
-    depth: u32,
-    decay: f64,
     seed: u64,
-    sketch: Sketch,
     num_items: u64,
+    sketch: Sketch,
 }
 
 impl TopKObject {
@@ -61,37 +57,15 @@ impl TopKObject {
     /// after the handler has parsed and validated all parameters.
     pub fn new_reserved(k: u32, width: u32, depth: u32, decay: f64, seed: u64) -> TopKObject {
         let sketch = Sketch::with_seed(k as usize, width as usize, depth as usize, decay, seed);
-        let topk = TopKObject {
-            k,
-            width,
-            depth,
-            decay,
-            seed,
-            sketch,
-            num_items: 0,
-        };
-        topk.topk_object_incr_metrics_on_new_create();
-        topk
+        Self::from_existing(seed, sketch, 0)
     }
 
     /// Create a new TopK object from existing data.
-    pub fn from_existing(
-        k: u32,
-        width: u32,
-        depth: u32,
-        decay: f64,
-        seed: u64,
-        sketch: Sketch,
-        num_items: u64,
-    ) -> TopKObject {
+    pub fn from_existing(seed: u64, sketch: Sketch, num_items: u64) -> TopKObject {
         let topk = TopKObject {
-            k,
-            width,
-            depth,
-            decay,
             seed,
-            sketch,
             num_items,
+            sketch,
         };
         topk.topk_object_incr_metrics_on_new_create();
         topk
@@ -101,17 +75,7 @@ impl TopKObject {
     /// contents (heavy/lobby cells and priority queue) and carries over the
     /// running item count.
     pub fn create_copy_from(src: &TopKObject) -> TopKObject {
-        let topk = TopKObject {
-            k: src.k,
-            width: src.width,
-            depth: src.depth,
-            decay: src.decay,
-            seed: src.seed,
-            sketch: src.sketch.clone(),
-            num_items: src.num_items,
-        };
-        topk.topk_object_incr_metrics_on_new_create();
-        topk
+        Self::from_existing(src.seed, src.sketch.clone(), src.num_items)
     }
 
     /// Estimated heap size of this object: wrapper struct + sketch internals
@@ -144,21 +108,23 @@ impl TopKObject {
     fn topk_object_incr_metrics_on_new_create(&self) {
         metrics::TOPK_NUM_OBJECTS.fetch_add(1, Ordering::Relaxed);
         metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.fetch_add(self.memory_usage(), Ordering::Relaxed);
-        metrics::TOPK_SUM_K_ACROSS_OBJECTS.fetch_add(self.k as u64, Ordering::Relaxed);
+        metrics::TOPK_SUM_K_ACROSS_OBJECTS.fetch_add(self.k() as u64, Ordering::Relaxed);
         metrics::TOPK_TOTAL_ITEMS_ADDED_ACROSS_OBJECTS.fetch_add(self.num_items, Ordering::Relaxed);
     }
 
+    /// The sketch validates these into u32 range on construction and load,
+    /// so the narrowing casts cannot truncate.
     pub fn k(&self) -> u32 {
-        self.k
+        self.sketch.top_items() as u32
     }
     pub fn width(&self) -> u32 {
-        self.width
+        self.sketch.width() as u32
     }
     pub fn depth(&self) -> u32 {
-        self.depth
+        self.sketch.depth() as u32
     }
     pub fn decay(&self) -> f64 {
-        self.decay
+        self.sketch.decay()
     }
     pub fn seed(&self) -> u64 {
         self.seed
@@ -213,15 +179,7 @@ impl TopKObject {
         if validate_size_limit && !Self::validate_size(k as u32, width as u32, depth as u32) {
             return Err(EXCEEDS_MAX_TOPK_SIZE);
         }
-        Ok(TopKObject::from_existing(
-            k as u32,
-            width as u32,
-            depth as u32,
-            decay,
-            seed,
-            sketch,
-            num_items,
-        ))
+        Ok(TopKObject::from_existing(seed, sketch, num_items))
     }
 
     /// Deserialize a byte array to TopK object. When `validate_size_limit` is
@@ -338,7 +296,7 @@ impl Drop for TopKObject {
     fn drop(&mut self) {
         metrics::TOPK_NUM_OBJECTS.fetch_sub(1, Ordering::Relaxed);
         metrics::TOPK_OBJECT_TOTAL_MEMORY_BYTES.fetch_sub(self.memory_usage(), Ordering::Relaxed);
-        metrics::TOPK_SUM_K_ACROSS_OBJECTS.fetch_sub(self.k as u64, Ordering::Relaxed);
+        metrics::TOPK_SUM_K_ACROSS_OBJECTS.fetch_sub(self.k() as u64, Ordering::Relaxed);
         metrics::TOPK_TOTAL_ITEMS_ADDED_ACROSS_OBJECTS.fetch_sub(self.num_items, Ordering::Relaxed);
     }
 }

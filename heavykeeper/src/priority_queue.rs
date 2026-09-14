@@ -47,7 +47,7 @@ impl<T: Ord + Clone + Hash + PartialEq, C: Counter> TopKQueue<T, C> {
     pub(crate) fn with_capacity_and_hasher(capacity: usize, hasher: SipState) -> Self {
         Self {
             item_store: Vec::with_capacity(capacity),
-            heap: Vec::with_capacity(capacity + 1),
+            heap: Vec::with_capacity(capacity),
             table: HashTable::with_capacity(capacity),
             capacity,
             sequence: 0,
@@ -182,8 +182,8 @@ impl<T: Ord + Clone + Hash + PartialEq, C: Counter> TopKQueue<T, C> {
         if self.item_store.len() < self.capacity {
             // Restore capacity to k after a defrag trimmed it, so it stays a
             // known constant for memory tracking.
-            if self.heap.capacity() < self.capacity + 1 {
-                self.heap.reserve_exact(self.capacity + 1 - self.heap.len());
+            if self.heap.capacity() < self.capacity {
+                self.heap.reserve_exact(self.capacity - self.heap.len());
             }
             if self.item_store.capacity() < self.capacity {
                 self.item_store
@@ -573,8 +573,6 @@ mod tests {
                 queue.upsert(format!("seed-{i}").into_bytes(), 1_000);
             }
             let table_bytes = queue.table.allocation_size();
-            // `|_| 0` excludes item heap bytes, so only the structure is measured.
-            let structural_bytes = queue.mem_bytes(|_| 0);
 
             // Every insert beats the current min, so each one evicts exactly one.
             for r in 0..5000u64 {

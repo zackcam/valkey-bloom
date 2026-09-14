@@ -161,8 +161,9 @@ pub struct CuckooTopK<T: Ord + Clone + Hash, F: Fingerprint = u64, C: Counter = 
     width_mask: usize,
     depth: usize,
     decay: f64,
-    lobbies: Box<[CuckooCell<F, C>]>,
-    heavy: Box<[CuckooCell<F, C>]>,
+    /// One bucket-major array: bucket `b` is `cells[b * (depth + 1) ..]`,
+    /// lobby cell first, then its `depth` heavy slots.
+    cells: Box<[CuckooCell<F, C>]>,
     priority_queue: TopKQueue<T, C>,
     hasher: SipState,
     rng: Rng,
@@ -238,8 +239,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
             width_mask,
             depth,
             decay,
-            lobbies: vec![CuckooCell::default(); width].into_boxed_slice(),
-            heavy: vec![CuckooCell::default(); width * depth].into_boxed_slice(),
+            cells: vec![CuckooCell::default(); width * (depth + 1)].into_boxed_slice(),
             priority_queue: TopKQueue::with_capacity_and_hasher(k, hasher.clone()),
             hasher,
             rng,
@@ -282,9 +282,9 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         let (primary, alternate) = self.bucket_pair(fp.as_u64());
 
         if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-            let updated = self.heavy[idx].count.as_u64().saturating_add(increment);
-            self.heavy[idx].count = C::from_u64(updated);
-            return self.update_priority_queue(item, self.heavy[idx].count.as_u64());
+            let updated = self.cells[idx].count.as_u64().saturating_add(increment);
+            self.cells[idx].count = C::from_u64(updated);
+            return self.update_priority_queue(item, self.cells[idx].count.as_u64());
         }
 
         let lobby_count = match self.update_lobby(primary, fp, increment) {
@@ -328,9 +328,9 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         let fp = F::from_hash(self.hasher.hash_one(item));
         let (primary, alternate) = self.bucket_pair(fp.as_u64());
         if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-            return self.heavy[idx].count.as_u64();
+            return self.cells[idx].count.as_u64();
         }
-        let lobby = self.lobbies[primary];
+        let lobby = self.cells[self.lobby_index(primary)];
         if lobby.fingerprint == fp {
             lobby.count.as_u64()
         } else {
@@ -419,8 +419,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     where
         G: Fn(&T) -> usize,
     {
-        self.lobbies.len() * std::mem::size_of::<CuckooCell<F, C>>()
-            + self.heavy.len() * std::mem::size_of::<CuckooCell<F, C>>()
+        self.cells.len() * std::mem::size_of::<CuckooCell<F, C>>()
             + self.priority_queue.mem_bytes(item_heap)
     }
 
@@ -509,8 +508,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         // is currently in self's lobby for that primary bucket, fold its
         // count in and clear the lobby — an item should live in heavy XOR
         // lobby, never both.
-        for o_idx in 0..other.heavy.len() {
-            let oc = other.heavy[o_idx];
+        for &oc in other.heavy_cells() {
             if oc.count == C::ZERO {
                 continue;
             }
@@ -518,19 +516,20 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
             let mut count = oc.count.as_u64();
             let (primary, alternate) = self.bucket_pair(fp.as_u64());
 
-            if self.lobbies[primary].count > C::ZERO && self.lobbies[primary].fingerprint == fp {
-                count = count.saturating_add(self.lobbies[primary].count.as_u64());
-                self.lobbies[primary] = CuckooCell::default();
+            let li = self.lobby_index(primary);
+            if self.cells[li].count > C::ZERO && self.cells[li].fingerprint == fp {
+                count = count.saturating_add(self.cells[li].count.as_u64());
+                self.cells[li] = CuckooCell::default();
             }
 
             if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-                self.heavy[idx].count =
-                    C::from_u64(self.heavy[idx].count.as_u64().saturating_add(count));
+                self.cells[idx].count =
+                    C::from_u64(self.cells[idx].count.as_u64().saturating_add(count));
                 continue;
             }
 
             if let Some(idx) = self.find_empty_heavy_in_bucket(primary) {
-                self.heavy[idx] = CuckooCell {
+                self.cells[idx] = CuckooCell {
                     fingerprint: fp,
                     count: C::from_u64(count),
                 };
@@ -538,7 +537,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
             }
             if alternate != primary {
                 if let Some(idx) = self.find_empty_heavy_in_bucket(alternate) {
-                    self.heavy[idx] = CuckooCell {
+                    self.cells[idx] = CuckooCell {
                         fingerprint: fp,
                         count: C::from_u64(count),
                     };
@@ -548,9 +547,9 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
 
             let (victim_idx, victim_count) = self.min_heavy_in_candidates(primary, alternate);
             if count > victim_count {
-                let victim_bucket = victim_idx / self.depth;
-                let victim = self.heavy[victim_idx];
-                self.heavy[victim_idx] = CuckooCell {
+                let victim_bucket = self.bucket_of(victim_idx);
+                let victim = self.cells[victim_idx];
+                self.cells[victim_idx] = CuckooCell {
                     fingerprint: fp,
                     count: C::from_u64(count),
                 };
@@ -563,8 +562,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         // self (via either candidate bucket), fold the lobby count into
         // the heavy entry. Otherwise resolve lobby-vs-lobby conflicts
         // deterministically.
-        for o_idx in 0..other.lobbies.len() {
-            let oc = other.lobbies[o_idx];
+        for &oc in other.lobby_cells() {
             if oc.count == C::ZERO {
                 continue;
             }
@@ -573,17 +571,17 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
             let (primary, alternate) = self.bucket_pair(fp.as_u64());
 
             if let Some(idx) = self.find_heavy(fp, primary, alternate) {
-                self.heavy[idx].count =
-                    C::from_u64(self.heavy[idx].count.as_u64().saturating_add(count));
+                self.cells[idx].count =
+                    C::from_u64(self.cells[idx].count.as_u64().saturating_add(count));
                 continue;
             }
 
-            let lobby = self.lobbies[primary];
+            let li = self.lobby_index(primary);
+            let lobby = self.cells[li];
             if lobby.count > C::ZERO && lobby.fingerprint == fp {
-                self.lobbies[primary].count =
-                    C::from_u64(lobby.count.as_u64().saturating_add(count));
+                self.cells[li].count = C::from_u64(lobby.count.as_u64().saturating_add(count));
             } else if lobby.count == C::ZERO || count > lobby.count.as_u64() {
-                self.lobbies[primary] = CuckooCell {
+                self.cells[li] = CuckooCell {
                     fingerprint: fp,
                     count: C::from_u64(count),
                 };
@@ -597,22 +595,52 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     }
 
     /// Relocate the sketch's large heap allocations through `reallocator` (see
-    /// [`Reallocator`]): the `lobbies` and `heavy` bucket arrays and the
+    /// [`Reallocator`]): the bucket cell array and the
     /// priority queue's vectors. Logical contents (counts,
     /// tracked items, query results) are unchanged. Not panic-atomic: if
     /// `reallocator` panics partway through, the sketch may be left logically
     /// inconsistent.
     pub fn realloc_large_heap_allocated_objects<R: Reallocator>(&mut self, reallocator: &mut R) {
-        realloc_large_heap_allocated_object(&mut self.lobbies, reallocator);
-        realloc_large_heap_allocated_object(&mut self.heavy, reallocator);
+        realloc_large_heap_allocated_object(&mut self.cells, reallocator);
         self.priority_queue
             .realloc_large_heap_allocated_objects(reallocator);
     }
 
+    /// Cells per bucket: one lobby plus `depth` heavy slots.
+    #[inline]
+    fn stride(&self) -> usize {
+        self.depth + 1
+    }
+
+    /// Index of `bucket`'s lobby cell in `cells`.
+    #[inline]
+    fn lobby_index(&self, bucket: usize) -> usize {
+        bucket * self.stride()
+    }
+
+    /// Indices of `bucket`'s heavy slots in `cells`.
     #[inline]
     fn heavy_range(&self, bucket: usize) -> std::ops::Range<usize> {
-        let start = bucket * self.depth;
+        let start = self.lobby_index(bucket) + 1;
         start..start + self.depth
+    }
+
+    /// Bucket that owns cell `idx`.
+    #[inline]
+    fn bucket_of(&self, idx: usize) -> usize {
+        idx / self.stride()
+    }
+
+    /// The lobby cells, in bucket order.
+    fn lobby_cells(&self) -> impl Iterator<Item = &CuckooCell<F, C>> {
+        self.cells.iter().step_by(self.stride())
+    }
+
+    /// The heavy cells, in bucket order then slot order (the serialized order).
+    fn heavy_cells(&self) -> impl Iterator<Item = &CuckooCell<F, C>> {
+        self.cells
+            .chunks(self.stride())
+            .flat_map(|bucket| &bucket[1..])
     }
 
     #[inline]
@@ -653,22 +681,22 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     #[inline]
     fn find_heavy_in_bucket(&self, fingerprint: F, bucket: usize) -> Option<usize> {
         self.heavy_range(bucket).find(|&idx| {
-            self.heavy[idx].count > C::ZERO && self.heavy[idx].fingerprint == fingerprint
+            self.cells[idx].count > C::ZERO && self.cells[idx].fingerprint == fingerprint
         })
     }
 
     #[inline]
     fn find_empty_heavy_in_bucket(&self, bucket: usize) -> Option<usize> {
         self.heavy_range(bucket)
-            .find(|&idx| self.heavy[idx].count == C::ZERO)
+            .find(|&idx| self.cells[idx].count == C::ZERO)
     }
 
     #[inline]
     fn min_heavy_in_bucket(&self, bucket: usize) -> (usize, u64) {
-        let mut min_idx = bucket * self.depth;
+        let mut min_idx = self.heavy_range(bucket).start;
         let mut min_count = u64::MAX;
         for idx in self.heavy_range(bucket) {
-            let count = self.heavy[idx].count.as_u64();
+            let count = self.cells[idx].count.as_u64();
             if count < min_count {
                 min_idx = idx;
                 min_count = count;
@@ -691,7 +719,8 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     }
 
     fn update_lobby(&mut self, bucket: usize, fingerprint: F, increment: u64) -> Option<u64> {
-        let lobby = &mut self.lobbies[bucket];
+        let li = self.lobby_index(bucket);
+        let lobby = &mut self.cells[li];
         if lobby.count == C::ZERO || lobby.fingerprint == fingerprint {
             lobby.fingerprint = fingerprint;
             lobby.count = C::from_u64(lobby.count.as_u64().saturating_add(increment));
@@ -702,7 +731,8 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
     }
 
     fn clear_lobby(&mut self, bucket: usize, fingerprint: F) {
-        let lobby = &mut self.lobbies[bucket];
+        let li = self.lobby_index(bucket);
+        let lobby = &mut self.cells[li];
         if lobby.fingerprint == fingerprint {
             *lobby = CuckooCell::default();
         }
@@ -710,7 +740,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
 
     fn promote(&mut self, fingerprint: F, count: u64, primary: usize, alternate: usize) -> bool {
         if let Some(idx) = self.find_empty_heavy_in_bucket(primary) {
-            self.heavy[idx] = CuckooCell {
+            self.cells[idx] = CuckooCell {
                 fingerprint,
                 count: C::from_u64(count),
             };
@@ -719,7 +749,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
 
         if alternate != primary {
             if let Some(idx) = self.find_empty_heavy_in_bucket(alternate) {
-                self.heavy[idx] = CuckooCell {
+                self.cells[idx] = CuckooCell {
                     fingerprint,
                     count: C::from_u64(count),
                 };
@@ -732,9 +762,9 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
             return false;
         }
 
-        let victim_bucket = victim_idx / self.depth;
-        let victim = self.heavy[victim_idx];
-        self.heavy[victim_idx] = CuckooCell {
+        let victim_bucket = self.bucket_of(victim_idx);
+        let victim = self.cells[victim_idx];
+        self.cells[victim_idx] = CuckooCell {
             fingerprint,
             count: C::from_u64(count),
         };
@@ -759,7 +789,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
             }
 
             if let Some(empty_idx) = self.find_empty_heavy_in_bucket(target) {
-                self.heavy[empty_idx] = victim;
+                self.cells[empty_idx] = victim;
                 return;
             }
 
@@ -768,7 +798,7 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
                 return;
             }
 
-            std::mem::swap(&mut self.heavy[target_min_idx], &mut victim);
+            std::mem::swap(&mut self.cells[target_min_idx], &mut victim);
             from_bucket = target;
         }
     }
@@ -780,12 +810,13 @@ impl<T: Ord + Clone + Hash, F: Fingerprint, C: Counter> CuckooTopK<T, F, C> {
         increment: u64,
     ) -> Option<u64> {
         let mut remaining = increment;
-        let mut current_count = self.lobbies[bucket].count.as_u64();
+        let li = self.lobby_index(bucket);
+        let mut current_count = self.cells[li].count.as_u64();
         let mut threshold = self.decay_threshold(current_count);
         while remaining > 0 {
             if self.rng.u64(..) < threshold {
                 current_count = current_count.saturating_sub(1);
-                let lobby = &mut self.lobbies[bucket];
+                let lobby = &mut self.cells[li];
                 lobby.count = C::from_u64(current_count);
                 if lobby.count == C::ZERO {
                     lobby.fingerprint = fingerprint;
@@ -858,7 +889,7 @@ where
     /// position is stored (`rng_state`) and restored exactly.
     pub fn to_bytes(&self) -> Vec<u8> {
         let cs = cuckoo_cell_size::<F, C>();
-        let cell_count = self.lobbies.len() + self.heavy.len();
+        let cell_count = self.cells.len();
         let pq_len = self.priority_queue.len();
         // Capacity hint: header (magic + variant + version + probe + 5 u64s + widths) + cells + pq_len u64 + pq estimate + rng.
         let mut out = Vec::with_capacity(
@@ -878,7 +909,8 @@ where
         out.push(F::SIZE as u8);
         out.push(C::SIZE as u8);
 
-        for cell in self.lobbies.iter().chain(self.heavy.iter()) {
+        // Wire order is lobbies then heavy (the pre-interleave layout).
+        for cell in self.lobby_cells().chain(self.heavy_cells()) {
             cell.fingerprint.to_le_bytes_into(&mut out);
             cell.count.to_le_bytes_into(&mut out);
         }
@@ -979,8 +1011,13 @@ where
             Rng::with_seed(seed),
             max_kicks,
         );
-        sketch.lobbies = lobbies;
-        sketch.heavy = heavy;
+        // Interleave the wire's lobbies-then-heavy into the bucket-major layout.
+        let mut cells = Vec::with_capacity(lobbies.len() + heavy.len());
+        for (b, lobby) in lobbies.iter().enumerate() {
+            cells.push(*lobby);
+            cells.extend_from_slice(&heavy[b * depth..(b + 1) * depth]);
+        }
+        sketch.cells = cells.into_boxed_slice();
 
         for _ in 0..pq_len {
             let key_len = reader.take_usize("priority_queue key length")?;
@@ -1132,8 +1169,7 @@ mod tests {
         assert_eq!(topk.depth, 3);
         assert_eq!(topk.decay, 0.9);
         assert_eq!(topk.top_items, 10);
-        assert_eq!(topk.lobbies.len(), 64);
-        assert_eq!(topk.heavy.len(), 192);
+        assert_eq!(topk.cells.len(), 64 + 192);
     }
 
     #[test]
@@ -1495,7 +1531,7 @@ mod tests {
     fn test_merge_folds_other_lobby_into_self_heavy() {
         // self has x heavy with a high count; other has x in lobby.
         // The lobby contribution from other must fold into self's heavy
-        // entry — not be written into self.lobbies alongside it (where
+        // entry — not be written into self's lobby alongside it (where
         // bucket_count() would miss it because it short-circuits on
         // heavy hits).
         let mut a: CuckooTopK<Vec<u8>> = CuckooTopK::with_seed(10, 1, 1, 0.9, 1);
